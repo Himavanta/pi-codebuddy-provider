@@ -23,6 +23,7 @@
     "url": "git+https://github.com/Himavanta/pi-codebuddy-provider.git"
   },
   "files": [
+    "scripts",
     "src",
     "README.md",
     "LICENSE"
@@ -32,7 +33,7 @@
   "scripts": {
     "test": "vp test",
     "check": "vp check",
-    "prepare": "vp config"
+    "prepare": "node scripts/prepare.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.1.0",
