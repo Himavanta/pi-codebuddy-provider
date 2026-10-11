@@ -1,0 +1,61 @@
+{
+  "name": "pi-codebuddy-provider",
+  "version": "0.0.0",
+  "description": "Pi extension that registers CodeBuddy (IOA) as an OpenAI-compatible HTTP provider with OAuth/API-key auth",
+  "keywords": [
+    "codebuddy",
+    "extension",
+    "ioa",
+    "oauth",
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "provider"
+  ],
+  "homepage": "https://github.com/Himavanta/pi-codebuddy-provider#readme",
+  "bugs": {
+    "url": "https://github.com/Himavanta/pi-codebuddy-provider/issues"
+  },
+  "license": "MIT",
+  "author": "Himavanta",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Himavanta/pi-codebuddy-provider.git"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vp test",
+    "check": "vp check",
+    "prepare": "vp config"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "catalog:",
+    "@earendil-works/pi-coding-agent": "catalog:",
+    "@types/node": "^26.1.1",
+    "bumpp": "^11.1.0",
+    "typescript": "^7.0.2",
+    "vite-plus": "catalog:"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.11.2",
+      "onFail": "download"
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
