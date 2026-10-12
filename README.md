@@ -33,17 +33,34 @@ pi install git:github.com/Himavanta/pi-codebuddy-provider
 | `CODEBUDDY_AUTH`     | `auto`     | `auto` / `oauth` / `api`                                                      |
 | `CODEBUDDY_API_KEY`  | 空         | API Key 模式的密钥                                                            |
 | `CODEBUDDY_ENDPOINT` | 空         | 自定义端点，设置后忽略 `CODEBUDDY_NETWORK`                                    |
-| `CODEBUDDY_MODEL`    | 空         | 覆写请求中的模型 ID，见下方「指定任意模型」                                   |
+| `CODEBUDDY_MODEL`    | 空         | 覆写请求中的模型 ID，见下方「模型」                                           |
 
 其余为调优项（重试次数、思考泄漏开关、身份覆盖、会话 ID 缓存上限等），
 见 [`src/config.ts`](./src/config.ts)。
+
+## 模型
+
+启动和登录后拉取 `/v3/config`，取 craft agent 的模型清单注册给 Pi。
+这个清单不一定等于 CodeBuddy 的完整模型列表：部分模型（如 `glm-5v-turbo`、
+`kimi-k2.6`）接口不返回，因此不会出现在 Pi 的模型选择里。
+
+### 指定任意模型
+
+设置 `CODEBUDDY_MODEL` 可强制用指定模型，即使它不在模型列表里：
+
+```bash
+CODEBUDDY_MODEL=glm-5v-turbo pi
+```
+
+该值会覆写请求体中的 `model` 字段（网关按此字段选模型）。
+注意：Pi 界面上仍会显示当前选中的模型，与实际发往上游的模型不一定一致。
+模型 ID 无效时，上游会返回 `400`，错误信息为 `model [...] service info not found`。
 
 ## 功能
 
 **模型与能力**
 
-- 启动和登录后拉取 `/v3/config`，把 craft agent 的模型清单注册给 Pi，
-  并缓存到 `~/.pi/agent/codebuddy-models-cache.json` 作为下次启动的种子。
+- 模型清单缓存到 `~/.pi/agent/codebuddy-models-cache.json`，作为下次启动的种子。
 - 推理能力与图片输入优先采信上游的 `supportsReasoning` / `supportsImages`，
   字段缺失时才回退到模型 ID 猜测。
 - 思考档位按上游 `supportedEfforts` 生成 `thinkingLevelMap`，不支持的档位显式置空。
@@ -62,32 +79,12 @@ pi install git:github.com/Himavanta/pi-codebuddy-provider
 扩展在 SSE 层把标记之前的文本改道到 `reasoning_content`，并将标记本身删除。
 默认开启，可用 `CODEBUDDY_LEAKED_REASONING=0` 关闭。
 
-## 模型列表
-
-扩展启动时从 `/v3/config` 取 craft agent 的模型清单。这个清单不一定等于
-CodeBuddy 的完整模型列表：部分模型（如 `glm-5v-turbo`、`kimi-k2.6`）
-接口不返回，因此不会出现在 Pi 的模型选择里。
-
-这类模型可以用 `CODEBUDDY_MODEL` 强制指定，见下节。
-
-## 指定任意模型
-
-设置 `CODEBUDDY_MODEL` 可强制用指定模型，即使它不在模型列表里：
-
-```bash
-CODEBUDDY_MODEL=glm-5v-turbo pi
-```
-
-该值会覆写请求体中的 `model` 字段（网关按此字段选模型）。
-注意：Pi 界面上仍会显示当前选中的模型，与实际发往上游的模型不一定一致。
-模型 ID 无效时，上游会返回 `400`，错误信息为 `model [...] service info not found`。
-
 ## 已知限制
 
 - 非官方扩展，依赖模拟 IDE 客户端行为，上游改动可能导致失效。
 - token 过期会自动刷新；仅当刷新失败时才需要重新 `/login codebuddy`，此时日志会提示。
 - 模型缓存不会自愈：只作为启动种子，需要一次成功的网络发现才会更新。
-- 模型列表不含 CodeBuddy 的全部可用模型，详见「模型列表」。
+- 模型列表不含 CodeBuddy 的全部可用模型。
 - 429 与瞬时 400 的处理是尽力而为，不覆盖上游所有错误形态。
 
 ## 开发
