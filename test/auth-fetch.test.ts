@@ -88,6 +88,26 @@ describe('auth-fetch (pi)', () => {
     const sent = JSON.parse(spy.mock.calls[0][1].body)
     expect(sent).toEqual({ stream: false, messages: [] })
   })
+  it('cfg.model 覆写 body.model（网关按 body 选模型，改 X-Model-ID 无效）', async () => {
+    const spy = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
+    const af = createAuthFetch(
+      makeDeps({ fetchImpl: spy as any, cfg: { model: 'glm-5v-turbo' } as any })
+    )
+    await af('https://x/v2/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ stream: true, model: 'hy3' })
+    })
+    expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe('glm-5v-turbo')
+  })
+  it('cfg.model 为空时不改 body.model', async () => {
+    const spy = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
+    const af = createAuthFetch(makeDeps({ fetchImpl: spy as any, cfg: { model: '' } as any }))
+    await af('https://x/v2/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ stream: true, model: 'hy3' })
+    })
+    expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe('hy3')
+  })
   it('请求路径用 chatCompletionsPath 而非硬拼', async () => {
     const spy = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
     const af = createAuthFetch(

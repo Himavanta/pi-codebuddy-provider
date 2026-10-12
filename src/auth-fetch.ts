@@ -89,20 +89,34 @@ function createIdentityMemo(resolve: (token: string) => Identity): (token: strin
   }
 }
 
-/** 仅处理字符串 JSON body；其他类型（Stream/FormData/Blob）跳过解析直接透传。
- *  stream:true 时补 `stream_options.include_usage`（网关默认不下发 usage）。 */
-function rewriteStreamBody(body: BodyInit | null | undefined): BodyInit | null | undefined {
+/**
+ * 归一化请求体（仅处理字符串 JSON，其余类型原样透传）：
+ *
+ * - `modelOverride` 非空时覆写 `body.model`。网关按 body 的 `model` 字段选模型，
+ *   `X-Model-ID` 头不参与选择，因此 CODEBUDDY_MODEL 必须落到 body 上才生效。
+ * - `stream:true` 时补 `stream_options.include_usage`（网关默认不下发 usage）。
+ */
+function rewriteRequestBody(
+  body: BodyInit | null | undefined,
+  modelOverride: string | undefined
+): BodyInit | null | undefined {
   if (typeof body !== 'string') return body
   try {
     const parsed = JSON.parse(body)
+    let changed = false
+    if (modelOverride && parsed.model !== modelOverride) {
+      parsed.model = modelOverride
+      changed = true
+    }
     if (parsed.stream === true && !parsed.stream_options) {
       parsed.stream_options = { include_usage: true }
-      return JSON.stringify(parsed)
+      changed = true
     }
+    return changed ? JSON.stringify(parsed) : body
   } catch {
     /* 非 JSON body：原样透传 */
+    return body
   }
-  return body
 }
 
 export function createAuthFetch(deps: AuthFetchDeps) {
@@ -130,7 +144,7 @@ export function createAuthFetch(deps: AuthFetchDeps) {
     return doFetch()(`${server.url}${chatCompletionsPath}`, {
       method: 'POST',
       headers,
-      body: rewriteStreamBody(init.body),
+      body: rewriteRequestBody(init.body, cfg.model),
       signal: init.signal
     })
   }
