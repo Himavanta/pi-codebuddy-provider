@@ -80,6 +80,10 @@ export function buildRequestHeaders(
     'X-B3-SpanId': spanId,
     'X-B3-Sampled': '1'
   }
+  // X-Model-ID 实测不参与模型选择（网关按 body 的 model 字段选，2026-10-14 实测）：
+  //   body=hy3,          X-Model-ID=glm-5v-turbo  → 服务端回显 hy3
+  //   body=glm-5v-turbo, X-Model-ID=hy3           → 服务端回显 glm-5v-turbo
+  // 仍照官方客户端发送：它可能参与网关的日志 / 风控判定，移除有未知风险。
   const resolved = resolveModel(modelId, cfg)
   if (resolved) headers['X-Model-ID'] = resolved
   return headers
