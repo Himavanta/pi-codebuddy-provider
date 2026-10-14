@@ -35,11 +35,6 @@ export function jsonResponse(body: unknown, status: number, headers?: Headers): 
   })
 }
 
-/** 原样透传文本内容的响应（不重新序列化 body，仅统一 Content-Type）。 */
-export function textResponse(text: string, status: number, headers: Headers): Response {
-  return new Response(text, { status, headers: withJsonContentType(headers) })
-}
-
 /** 读取响应文本；body 已被消费或不可读时返回空串，绝不抛错。 */
 export async function safeText(response: Response): Promise<string> {
   try {

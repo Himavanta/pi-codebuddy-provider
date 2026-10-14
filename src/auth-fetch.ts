@@ -6,12 +6,7 @@
 //   - retry-policy.ts  上游错误状态策略（429 限流、11133 瞬时 400）
 import type { AuthState } from './auth-state.ts'
 import type { CodeBuddyConfig, ServerInfo } from './config.ts'
-import {
-  headersWithoutEntity,
-  jsonResponse,
-  resolveRequestUrl,
-  textResponse
-} from './http-utils.ts'
+import { headersWithoutEntity, jsonResponse, resolveRequestUrl } from './http-utils.ts'
 import type { Identity, JwtPayload } from './jwt.ts'
 import type { Logger } from './log.ts'
 import {
@@ -26,6 +21,7 @@ import {
   retryTransient400,
   type RetryContext
 } from './retry-policy.ts'
+import { formatUpstreamError, parseUpstreamError } from './upstream-error.ts'
 
 /** oauth 之外的模式（api）没有身份头。 */
 const EMPTY_IDENTITY: Identity = { tenantId: '', enterpriseId: '', userId: '' }
@@ -168,7 +164,9 @@ export function createAuthFetch(deps: AuthFetchDeps) {
     return { auth: next, response: await requestWithAuth(init, next) }
   }
 
-  /** 非 2xx：统一 Content-Type 为 JSON；body 已被消费时用循环内缓存的文本重建。 */
+  /** 非 2xx：转成面向用户的文案（含上游 displayMsg / displayTips）。
+   *  body 已被消费时用循环内缓存的文本重建（如 11133 退避期间 abort）；
+   *  两者都拿不到才退回状态码说明。 */
   async function normalizeErrorResponse(
     response: Response,
     lastText: string,
@@ -180,10 +178,12 @@ export function createAuthFetch(deps: AuthFetchDeps) {
     } catch {
       text = response.status === 400 ? lastText : ''
     }
-    if (text) return textResponse(text, response.status, response.headers)
-    const message = init.signal?.aborted
-      ? 'codebuddy: request aborted'
-      : `codebuddy: upstream ${response.status} (unreadable body)`
+    // 优先用真实上游 body：即使请求已被取消，上游错误码仍是更准的信息
+    const message = text.trim()
+      ? formatUpstreamError(parseUpstreamError(text), response.status, text)
+      : init.signal?.aborted
+        ? 'codebuddy: 请求已取消'
+        : `codebuddy: 上游 ${response.status} 未返回响应体`
     return jsonResponse({ error: { message } }, response.status, response.headers)
   }
 

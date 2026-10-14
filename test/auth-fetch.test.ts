@@ -182,17 +182,22 @@ describe('auth-fetch (pi)', () => {
     expect(spy).toHaveBeenCalledTimes(2)
   })
   it('非 11133 的 400 不重试，原样透传', async () => {
-    const spy = vi
-      .fn()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ code: 11101, msg: 'invalid' }), { status: 400 })
+    const spy = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ code: 11101, msg: 'Non-stream chat request is not supported' }),
+        {
+          status: 400
+        }
       )
+    )
     const af = createAuthFetch(makeDeps({ fetchImpl: spy as any }))
     const res = await af('https://x/v2/chat/completions', { method: 'POST', body: '{}' })
     expect(res.status).toBe(400)
     expect(spy).toHaveBeenCalledTimes(1)
+    // 不再透传原始上游 JSON，转为可读文案（保留上游错误码便于排查）
     const body = await res.json()
-    expect(body.code).toBe(11101)
+    expect(body.error.message).toContain('11101')
+    expect(body.error.message).toContain('Non-stream chat request is not supported')
   })
   it('认证头注入（api 双头）', async () => {
     const spy = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
@@ -308,7 +313,10 @@ describe('auth-fetch 修复回归', () => {
     setTimeout(() => ctrl.abort(), 30) // 在退避 sleep（1s）中触发 abort
     const res = await p // 原实现此处会 reject（TypeError: Body is unusable）
     expect(res.status).toBe(400)
-    expect(await res.json()).toMatchObject({ code: 11133 })
+    // 即使请求已被取消，上游错误信息仍应保留（比「已取消」更有排查价值）
+    const body = await res.json()
+    expect(body.error.message).toContain('11133')
+    expect(body.error.message).toContain('transient')
     expect(spy).toHaveBeenCalledTimes(1) // abort 后不再重发
   })
 
