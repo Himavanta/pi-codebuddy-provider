@@ -63,7 +63,9 @@ CODEBUDDY_MODEL=glm-5v-turbo pi
 - 模型清单缓存到 `~/.pi/agent/codebuddy-models-cache.json`，作为下次启动的种子。
 - 推理能力与图片输入优先采信上游的 `supportsReasoning` / `supportsImages`，
   字段缺失时才回退到模型 ID 猜测。
-- 思考档位按上游 `supportedEfforts` 生成 `thinkingLevelMap`，不支持的档位显式置空。
+- 思考档位由上游声明生成：有 `supportedEfforts` 词表时按词表，只有 `effort`
+  单档时只暴露该档（不替上游扩展）；不支持的档位显式置空，不可关闭思考的模型
+  移除 `off` 档，避免发出上游拒收的空值。
 
 **请求处理**
 

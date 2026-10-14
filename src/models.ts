@@ -24,10 +24,13 @@ export interface RemoteModel {
   supportsReasoning?: boolean
   disabledMultimodal?: boolean
   reasoning?: {
+    /** 只有该字段时（无 supportedEfforts）：上游声明的默认档，也是唯一可用档 */
     effort?: string
     defaultEffort?: string
     supportedEfforts?: string[]
     canDisableThinking?: boolean
+    /** 上游固定的思考摘要提示（实测恒为 auto），pi 无对应字段，仅保持类型如实 */
+    summary?: string
   }
   contextWindow?: { defaultLength?: number; supportedLengths?: number[] }
 }
@@ -126,24 +129,43 @@ const DEFAULT_MAX_TOKENS = 8192
 // 移出可选集合，否则会在 UI 暴露、并被原样当作 reasoning_effort 发给上游。
 const PI_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high'] as const
 const PI_EXTENDED_LEVELS = ['xhigh', 'max'] as const
+/** pi 全部档位（不含 off）：「只有 effort」时用它判断 effort 是否为可表达的档位名 */
+const PI_KNOWN_LEVELS: readonly string[] = [...PI_THINKING_LEVELS, ...PI_EXTENDED_LEVELS]
 
 /**
- * 按上游 supportedEfforts 构建 pi 的 thinkingLevelMap。
+ * 按上游声明构建 pi 的 thinkingLevelMap。
  *
  * pi 语义是「pi 档位 → 上游取值」的映射，不是可用档位枚举；键必须是 pi 档位，
  * 值才是上游取值。官方模型目录（dist/providers/data/*.json，773 个样例）同样惯例：
  * 只列出需要声明的档位，不支持的档位写 null。
  *
- * 返回 undefined 表示无档位信息（上游未公布词表）。
+ * 上游 reasoning 有两种形态：
+ *   - supportedEfforts：完整词表（含 canDisableThinking / defaultEffort）
+ *   - effort：仅声明一个默认档，无词表
+ *
+ * 词表缺失时用 effort 兜底：只暴露声明的那一档，其余（含 off）显式 null。
+ * 上游「不发 reasoning_effort 即 400」（glm-5.1 code 11150）正是被这种模型触发的，
+ * 而 effort 是其唯一可用的声明，丢弃它只能得到 400。同时不替上游扩展：
+ * 只声明一个档位的模型就只给一个档位。
+ *
+ * effort 不在 pi 档位集合内时返回 undefined（无法表达即不声明），
+ * 否则会产出「全档位皆 null」的空 map——pi 会退回 off，反而丢掉该档。
  */
 export function buildThinkingLevelMap(m: RemoteModel): Record<string, string | null> | undefined {
-  const efforts = m.reasoning?.supportedEfforts
+  const wordList = m.reasoning?.supportedEfforts
+  const effort = m.reasoning?.effort
+  const efforts = wordList?.length
+    ? wordList
+    : effort && PI_KNOWN_LEVELS.includes(effort)
+      ? [effort]
+      : undefined
   if (!efforts?.length) return undefined
   const supported = new Set(efforts)
   const map: Record<string, string | null> = {}
-  // off：仅当上游允许关闭思考（canDisableThinking）时才可选；否则显式 null 移除。
+  // off：仅当上游公开词表且允许关闭思考时才可选，否则显式 null 移出可选集合。
+  // 只有 effort 时上游未声明可关闭，一律移出（不能切换档位）。
   // 注意离开时不携带 reasoning_effort（pi-ai 仅在 map.off 为字符串时才发送）。
-  if (m.reasoning?.canDisableThinking !== true) map.off = null
+  if (!wordList?.length || m.reasoning?.canDisableThinking !== true) map.off = null
   for (const level of PI_THINKING_LEVELS) {
     map[level] = supported.has(level) ? level : null
   }
@@ -232,12 +254,11 @@ export function remoteModelToPi(m: RemoteModel): PiModelConfig {
     // 生效，且不覆盖已有 thinking 内容），无需手改 body。
     compat: { supportsDeveloperRole: false, requiresReasoningContentOnAssistantMessages: true }
   }
-  const efforts = m.reasoning?.supportedEfforts
   const thinkingLevelMap = cfg.reasoning ? buildThinkingLevelMap(m) : undefined
   if (thinkingLevelMap) cfg.thinkingLevelMap = thinkingLevelMap
-  // 只有上游公布 effort 词表时才下发 reasoning_effort：网关对未收录参数返回 400（同
-  // supportsDeveloperRole 那段注释），词表未知时保持与今天完全一致的请求形状。
-  if (cfg.reasoning && !efforts?.length) {
+  // 档位信息完全缺失时才禁发 reasoning_effort：既无 supportedEfforts 也无 effort，
+  // 无从判断上游接受哪些值，保持请求形状不变（同 supportsDeveloperRole 那段注释）。
+  if (cfg.reasoning && !thinkingLevelMap) {
     cfg.compat = { ...cfg.compat, supportsReasoningEffort: false }
   }
   return cfg

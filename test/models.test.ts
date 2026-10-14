@@ -1,5 +1,6 @@
 import { normalizeContext } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/compat'
+import { clampThinkingLevel, getSupportedThinkingLevels } from '@earendil-works/pi-ai/models'
 import { describe, it, expect, vi } from 'vite-plus/test'
 
 import {
@@ -183,9 +184,88 @@ describe('models (pi)', () => {
   it('hy4-preview 是推理模型（旧实现写死 hy3 导致被误判为非推理）', () => {
     const m = remoteModelToPi({ id: 'hy4-preview', name: 'Hy4 preview' })
     expect(m.reasoning).toBe(true)
-    // 上游未公布 effort 词表时不下发 reasoning_effort，保持请求形状不变
+    // 上游对 ID 完全未声明档位（无 supportedEfforts 也无 effort）时才禁发 reasoning_effort
     expect(m.compat?.supportsReasoningEffort).toBe(false)
     expect(m.thinkingLevelMap).toBeUndefined()
+  })
+  it('glm-5.1（只有 effort，无词表）可下发 reasoning_effort，且不能关思考', () => {
+    // 回归：旧实现把「无 supportedEfforts」当成「无档位信息」→ 禁发 reasoning_effort，
+    // 而上游对该模型不收空值（400 code 11150），导致该模型在列表里但必然失败。
+    const m = remoteModelToPi({
+      id: 'glm-5.1',
+      name: 'GLM-5.1',
+      supportsReasoning: true,
+      reasoning: { effort: 'medium', summary: 'auto' }
+    })
+    expect(m.reasoning).toBe(true)
+    expect(m.compat?.supportsReasoningEffort).toBeUndefined()
+    expect(m.thinkingLevelMap).toMatchObject({ off: null, medium: 'medium' })
+    // 只有 medium 一档：其余档位不可选，避免发出上游没收的值
+    expect(m.thinkingLevelMap!.low).toBeNull()
+    expect(m.thinkingLevelMap!.high).toBeNull()
+  })
+  it('glm-5.1 端到端：经 pi-ai 管线实际发出 reasoning_effort=medium', () => {
+    // 本用例覆盖真实管线（remoteModelToPi → pi-ai openai-completions），
+    // 验证 thinkingLevelMap 在 pi 侧确实转化为非空 reasoning_effort。
+    const p = remoteModelToPi({
+      id: 'glm-5.1',
+      name: 'GLM-5.1',
+      supportsReasoning: true,
+      reasoning: { effort: 'medium', summary: 'auto' }
+    })
+    const model: any = {
+      ...p,
+      api: 'openai-completions',
+      provider: 'codebuddy',
+      baseUrl: 'https://x/v2'
+    }
+    const captured: any[] = []
+    const fetchFn = (async () =>
+      new Response('data: [DONE]\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' }
+      })) as any
+    const stream = openAICompletionsApi().streamSimple(
+      model,
+      normalizeContext({ systemPrompt: 'sys', messages: [{ role: 'user', content: 'hi' }] } as any),
+      {
+        apiKey: 'x',
+        fetch: fetchFn,
+        reasoning: 'medium',
+        onPayload: ((pl: any) => {
+          captured.push(pl)
+          return undefined
+        }) as any
+      }
+    )
+    return (async () => {
+      for await (const _ of stream) {
+        /* drain */
+      }
+      expect(captured[0].reasoning_effort).toBe('medium')
+    })()
+  })
+  it('glm-5.1（只有 effort）任何用户档位都钳到 medium，永不发出空值', async () => {
+    // 最危险的路径：glm-5.1 对「不发 reasoning_effort」返回 400（code 11150）。
+    // pi 在用户选 off 时会不带该字段（openai-completions.js:525），
+    // 因此必须靠 thinkingLevelMap 把 off 移出可选集合、并由 clamp 归到唯一档位。
+    const p = remoteModelToPi({
+      id: 'glm-5.1',
+      name: 'GLM-5.1',
+      supportsReasoning: true,
+      reasoning: { effort: 'medium', summary: 'auto' }
+    })
+    const model: any = {
+      ...p,
+      api: 'openai-completions',
+      provider: 'codebuddy',
+      baseUrl: 'https://x/v2'
+    }
+    expect(getSupportedThinkingLevels(model)).toEqual(['medium'])
+    const userLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+    for (const level of userLevels) {
+      expect(clampThinkingLevel(model, level)).toBe('medium')
+    }
   })
   it('上游 supportsReasoning=true 时不再被 ID 猜测覆盖', () => {
     expect(remoteModelToPi({ id: 'mystery-9', name: 'M', supportsReasoning: true }).reasoning).toBe(
@@ -281,10 +361,54 @@ describe('buildThinkingLevelMap（pi 档位 → 上游取值）', () => {
     reasoning
   })
 
-  it('上游未公布词表 → undefined（不下发 reason_effort）', () => {
+  it('上游未给出任何档位信息 → undefined（不下发 reasoning_effort）', () => {
     expect(buildThinkingLevelMap(mk(undefined))).toBeUndefined()
+    // defaultEffort 是词表内的元数据，不单独构成档位声明
     expect(buildThinkingLevelMap(mk({ defaultEffort: 'high' }))).toBeUndefined()
     expect(buildThinkingLevelMap(mk({ supportedEfforts: [] }))).toBeUndefined()
+  })
+
+  it('只有 effort → 只暴露该档，off 与其余档位置 null（glm-5.1 等）', () => {
+    const map = buildThinkingLevelMap(mk({ effort: 'medium' }))
+    expect(map).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: 'medium',
+      high: null
+    })
+    // 关键回归：glm-5.1 不发 reasoning_effort 即 400（code 11150），
+    // 只有 medium 一档可用，因此必须能选出该档的字符串值。
+    expect(map!.medium).toBe('medium')
+    // 不能关思考（off 被移除，用户无法切到不发字段的档位）
+    expect(map!.off).toBeNull()
+  })
+
+  it('effort 为 xhigh/max 时仅暴露扩展档', () => {
+    expect(buildThinkingLevelMap(mk({ effort: 'xhigh' }))).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: null,
+      xhigh: 'xhigh'
+    })
+    expect(buildThinkingLevelMap(mk({ effort: 'max' }))).toMatchObject({ max: 'max' })
+  })
+
+  it('supportedEfforts 优先于 effort（词表更权威）', () => {
+    const map = buildThinkingLevelMap(
+      mk({ effort: 'medium', supportedEfforts: ['low', 'high'], canDisableThinking: true })
+    )
+    expect(map).toEqual({ minimal: null, low: 'low', medium: null, high: 'high' })
+    // 上游公开词表且可关思考 → off 可逆
+    expect(map).not.toHaveProperty('off')
+  })
+
+  it('effort 不是合法 pi 档位 → undefined（无法表达则不声明）', () => {
+    expect(buildThinkingLevelMap(mk({ effort: 'banana' }))).toBeUndefined()
+    expect(buildThinkingLevelMap(mk({ effort: '' }))).toBeUndefined()
+    expect(buildThinkingLevelMap(mk({ effort: 'none' }))).toBeUndefined()
   })
 
   it('hy3（low/high）：medium 等不被上游支持的档位置 null', () => {
@@ -327,7 +451,7 @@ describe('buildThinkingLevelMap（pi 档位 → 上游取值）', () => {
       buildThinkingLevelMap(mk({ supportedEfforts: ['low', 'high'], canDisableThinking: false }))!
         .off
     ).toBeNull()
-    // 字段缺失（auto / glm-5.1 / kimi / minimax）按不可关处理
+    // 字段缺失（auto / hy3 / kimi / minimax）按不可关处理
     expect(buildThinkingLevelMap(mk({ supportedEfforts: ['low', 'high'] }))!.off).toBeNull()
   })
 
