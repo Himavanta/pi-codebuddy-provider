@@ -10,6 +10,7 @@
 import type { CodeBuddyConfig } from './config.ts'
 import { abortableSleep, headersWithoutEntity, jsonResponse, safeText } from './http-utils.ts'
 import type { Logger } from './log.ts'
+import { isCreditExhausted } from './upstream-error.ts'
 
 /** 11133 的退避序列（毫秒）。 */
 const TRANSIENT_400_DELAYS_MS = [1000, 4000, 10000, 25000]
@@ -52,7 +53,7 @@ export function parseRetryDelayMs(headers: Headers): number | undefined {
 
 /**
  * 合成可读的 429 错误 body。
- * 关键：终态（配额窗口很远）文案里带 "quota exceeded"，命中 Pi 的
+ * 关键：终态（配额已耗尽 / 窗口很远）文案里带 "quota exceeded"，命中 Pi 的
  * NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN → 立即失败；否则保留 "429 / rate limit"
  * 字样，交给 Pi 的退避重试。
  */
@@ -61,9 +62,12 @@ export function buildRateLimitMessage(
   terminal: boolean,
   gatewayBody: string
 ): string {
+  const extra = gatewayBody ? ` | 网关 body: ${gatewayBody.slice(0, 200)}` : ' | 网关未返回 body'
+  if (isCreditExhausted(gatewayBody)) {
+    return `codebuddy: 上游额度 / 余额已用尽（quota exceeded），重试无用。请充值、等待额度重置或改用其他模型。${extra}`
+  }
   const hint =
     hintMs === undefined ? '无 Retry-After 提示' : `网关建议 ${Math.ceil(hintMs / 1000)}s 后重试`
-  const extra = gatewayBody ? ` | 网关 body: ${gatewayBody.slice(0, 200)}` : ' | 网关未返回 body'
   if (terminal) {
     return `codebuddy: 上游配额超限（quota exceeded），${hint}，超出本地等待预算。等配额窗口过去或改用其他模型。${extra}`
   }
@@ -142,6 +146,9 @@ export interface RateLimitOutcome {
 /**
  * 处理上游 429：有 Retry-After 且在预算内则就地幂等重发；否则收集提示信息，
  * 由调用方合成可读错误体（区分终态与可重试）。
+ *
+ * 额度耗尽（如 14018 Credits exhausted）即使带 Retry-After 也当场终止：
+ * 等下去不会变得可用，重试只是白耗时间。
  */
 export async function handleRateLimit(
   response: Response,
@@ -151,6 +158,9 @@ export async function handleRateLimit(
   let current = response
   let hintMs = parseRetryDelayMs(current.headers)
   let gatewayBody = await safeText(current)
+  if (isCreditExhausted(gatewayBody)) {
+    return { response: current, terminal: true, hintMs, gatewayBody }
+  }
   const retries = cfg.rateLimitRetries ?? 0
   for (let attempt = 0; current.status === 429 && attempt < retries; attempt++) {
     if (ctx.signal?.aborted) break
@@ -167,10 +177,13 @@ export async function handleRateLimit(
     if (current.status === 429) {
       hintMs = parseRetryDelayMs(current.headers)
       gatewayBody = await safeText(current)
+      if (isCreditExhausted(gatewayBody)) break
     }
   }
+  const exhausted = isCreditExhausted(gatewayBody)
   const terminal =
-    current.status === 429 && (hintMs === undefined ? false : hintMs > cfg.rateLimitMaxWaitMs)
+    current.status === 429 &&
+    (exhausted || (hintMs !== undefined && hintMs > cfg.rateLimitMaxWaitMs))
   return { response: current, terminal, hintMs, gatewayBody }
 }
 

@@ -147,3 +147,46 @@ describe('auth-fetch 429 处理', () => {
     expect(await res.text()).toBe(sse)
   })
 })
+
+describe('429 额度耗尽（与普通限流区分）', () => {
+  const CREDIT_BODY = JSON.stringify({
+    code: 14018,
+    msg: 'Credits exhausted. Please visit the link below to purchase add-on packs'
+  })
+
+  it('额度耗尽即使带 Retry-After 也当场终止（重试无用）', async () => {
+    const spy = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(CREDIT_BODY, { status: 429, headers: { 'retry-after-ms': '10' } })
+      )
+    const af = createAuthFetch(makeDeps({ fetchImpl: spy as any, cfg: CFG_ON }))
+    const res = await af('https://x/v2/chat/completions', { method: 'POST', body: '{}' })
+    expect(res.status).toBe(429)
+    expect(spy).toHaveBeenCalledTimes(1) // CFG_ON 允许 1 次重试，但额度耗尽不应重试
+    const body = await res.json()
+    expect(body.error.code).toBe('quota_exceeded')
+    expect(body.error.message).toMatch(/额度|余额/)
+  })
+
+  it('普通限流仍按 Retry-After 重试', async () => {
+    const spy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response('rate limit exceeded, slow down', {
+          status: 429,
+          headers: { 'retry-after-ms': '10' }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response('data: [DONE]\n\n', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' }
+        })
+      )
+    const af = createAuthFetch(makeDeps({ fetchImpl: spy as any, cfg: CFG_ON }))
+    const res = await af('https://x/v2/chat/completions', { method: 'POST', body: '{}' })
+    expect(res.status).toBe(200)
+    expect(spy).toHaveBeenCalledTimes(2)
+  })
+})
