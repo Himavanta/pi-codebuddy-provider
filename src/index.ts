@@ -41,6 +41,7 @@ import {
   remoteModelToPi,
   DEFAULT_MODEL,
   DiscoveryCache,
+  isAuthError,
   type PiModelConfig,
   type RemoteModel
 } from './models.ts'
@@ -53,7 +54,9 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   const conversationIds = new LRUMap<string, string>(cfg.conversationMapMax)
   const discoveryCache = new DiscoveryCache({
     ttlMs: DISCOVERY_CACHE_TTL_MS,
-    fetchFn: (token, signal) => fetchRemoteModels(token, server, signal)
+    fetchFn: (token, signal) => fetchRemoteModels(token, server, signal),
+    // 降级的原因只在缓存内部被转成 null 信号，在此透出给日志（见 logDiscoveryFailure）
+    onFailure: (e) => logDiscoveryFailure(e)
   })
 
   // --- token 快照（~/.pi/agent/codebuddy-auth.json）---
@@ -186,13 +189,15 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
     return models.length ? models : null
   }
 
-  /** 发现失败的统一日志（令牌类失败提示重新登录） */
+  /** 发现失败的统一日志：认证类提示重新登录，其余把原因写清楚（含上游错误码与文案） */
   function logDiscoveryFailure(e: unknown): void {
-    const status = (e as { status?: number })?.status
-    if (status === 401 || status === 403) {
-      logger.warn('model discovery 401/403 — token may be expired, re-run /login codebuddy')
+    const message = e instanceof Error ? e.message : String(e)
+    if (isAuthError(e)) {
+      logger.warn(
+        `model discovery 认证失败 — token 可能已过期，请重新 /login codebuddy（${message}）`
+      )
     } else {
-      logger.warn(`model discovery failed: ${(e as Error).message}`)
+      logger.warn(`model discovery 失败，沿用现有模型列表：${message}`)
     }
   }
 

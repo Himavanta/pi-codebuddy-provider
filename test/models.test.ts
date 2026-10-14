@@ -1,11 +1,12 @@
 import { normalizeContext } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/compat'
 import { clampThinkingLevel, getSupportedThinkingLevels } from '@earendil-works/pi-ai/models'
-import { describe, it, expect, vi } from 'vite-plus/test'
+import { describe, it, expect, vi, afterEach } from 'vite-plus/test'
 
 import {
   remoteModelToPi,
   buildThinkingLevelMap,
+  fetchRemoteModels,
   DEFAULT_MODEL,
   DiscoveryCache
 } from '../src/models.ts'
@@ -514,5 +515,70 @@ describe('DiscoveryCache 瞬时失败降级保护', () => {
     const e = Object.assign(new Error('discovery 401'), { status: 401 })
     const c = new DiscoveryCache({ ttlMs: 1000, fetchFn: vi.fn().mockRejectedValue(e) })
     await expect(c.get('t', {})).rejects.toMatchObject({ status: 401 })
+  })
+})
+
+describe('fetchRemoteModels（/v3/config 发现）', () => {
+  const SERVER = { url: 'https://x', domain: 'd' }
+  /** 用真实响应形状：agents 分派清单 + models 详情 */
+  const okBody = {
+    code: 0,
+    data: {
+      agents: [{ name: 'craft', models: ['m1', 'm2', 'no-tool'] }],
+      models: [
+        { id: 'm1', name: 'M1' },
+        { id: 'm2', name: 'M2' },
+        { id: 'no-tool', name: 'N', supportsToolCall: false }
+      ]
+    }
+  }
+
+  function stubFetch(body: unknown, status = 200) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+            status,
+            headers: { 'Content-Type': 'application/json' }
+          })
+      )
+    )
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('按 craft 清单取模型，滤掉不支持工具调用的', async () => {
+    stubFetch(okBody)
+    const models = await fetchRemoteModels('t', SERVER)
+    expect(models.map((m) => m.id)).toEqual(['m1', 'm2'])
+  })
+
+  it('HTTP 400 + 上游错误体 → 抛 DiscoveryError（带 status 与错误码）', async () => {
+    stubFetch(
+      { code: 11151, msg: 'a message has empty content', displayMsg: { zh: '存在空白消息' } },
+      400
+    )
+    await expect(fetchRemoteModels('t', SERVER)).rejects.toMatchObject({ status: 400 })
+    await expect(fetchRemoteModels('t', SERVER)).rejects.toThrow(/存在空白消息/)
+  })
+
+  it('HTTP 200 但 code≠0 → 抛出（不再静默返回空）', async () => {
+    stubFetch({ code: 12403, msg: 'check ua' })
+    await expect(fetchRemoteModels('t', SERVER)).rejects.toThrow(/12403/)
+  })
+
+  it('无效凭据：200/code 0 但 agents 与 models 均为 null → 抛出而非 [auto]', async () => {
+    // 实测：token 无效时上游仍回 200/code 0，字段形状不同（data.agent 而非 data.agents）
+    stubFetch({ code: 0, msg: 'OK', data: { agent: { agents: null }, models: null } })
+    await expect(fetchRemoteModels('t', SERVER)).rejects.toThrow(/未返回任何模型/)
+  })
+
+  it('网络失败 → 抛出（由 DiscoveryCache 决定降级）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Promise.reject(new Error('boom')))
+    )
+    await expect(fetchRemoteModels('t', SERVER)).rejects.toThrow()
   })
 })

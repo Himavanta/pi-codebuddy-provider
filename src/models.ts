@@ -12,6 +12,7 @@ import {
 } from './config.ts'
 import type { ServerInfo } from './config.ts'
 import { fetchJson } from './fetch-json.ts'
+import { formatUpstreamError, parseUpstreamError } from './upstream-error.ts'
 
 export interface RemoteModel {
   id: string
@@ -61,6 +62,8 @@ export interface PiModelConfig {
 
 export interface RemoteConfigResponse {
   code: number
+  msg?: string
+  displayMsg?: Record<string, unknown>
   data?: { agents?: Array<{ name: string; models?: string[] }>; models?: RemoteModel[] }
 }
 /** /v3/config 发现的请求头（认证 Bearer + IDE 标识）。 */
@@ -82,22 +85,54 @@ function discoveryHeaders(accessToken: string, domain: string): Record<string, s
   }
 }
 
-/** 带 status 的发现错误：401/403 上抛给调用方决定是否提示重新登录。 */
-function discoveryError(status: number): Error & { status?: number } {
-  const e = new Error(`discovery ${status}`) as Error & { status?: number }
-  e.status = status
-  return e
+/** 发现失败：带 status 与可读原因，供调用方区分「重新登录」与其他失败。 */
+export class DiscoveryError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+    readonly upstreamCode?: number | string
+  ) {
+    super(message)
+    this.name = 'DiscoveryError'
+  }
 }
 
-/** 按 craft agent 的模型清单筛选：保留清单内、存在且支持工具调用的模型。 */
+/**
+ * 按 craft agent 的模型清单筛选：保留清单内、存在且支持工具调用的模型。
+ *
+ * 返回空数组表示响应可用但拿不到模型，由调用方决定是否降级：
+ * 无效 token 会得到 HTTP 200 / code 0，但 data.agents 与 data.models 均为 null
+ * （与有效响应的字段形状不同），必须当失败处理，不能退回 [DEFAULT_MODEL]。
+ */
 function selectCraftModels(data: NonNullable<RemoteConfigResponse['data']>): RemoteModel[] {
   const modelMap = new Map((data.models ?? []).map((m) => [m.id, m]))
   const craftAgent = (data.agents ?? []).find((a) => a.name === AGENT_INTENT)
   const craftIds = craftAgent?.models ?? []
-  if (craftIds.length === 0) return [DEFAULT_MODEL]
   return craftIds
     .map((id) => modelMap.get(id))
     .filter((m): m is RemoteModel => m !== undefined && m.supportsToolCall !== false)
+}
+
+/** 把 HTTP 失败响应转成 DiscoveryError（带上游错误码与可读文案）。 */
+function httpFailure(res: { status?: number; text: string }): DiscoveryError {
+  const info = parseUpstreamError(res.text)
+  const message =
+    res.status === undefined
+      ? `model discovery: ${res.text}`
+      : formatUpstreamError(info, res.status, res.text)
+  return new DiscoveryError(message, res.status, info.code)
+}
+
+/** body.code !== 0 或缺少 data：HTTP 200 但业务失败 */
+function payloadFailure(body: RemoteConfigResponse): DiscoveryError {
+  const info = parseUpstreamError(JSON.stringify(body))
+  const code = body.code
+  const reason = info.display ?? info.msg ?? info.tips ?? '缺少 data'
+  return new DiscoveryError(
+    `model discovery 响应异常（上游错误码 ${code}）：${reason}`,
+    undefined,
+    code
+  )
 }
 
 export async function fetchRemoteModels(
@@ -110,13 +145,18 @@ export async function fetchRemoteModels(
     timeoutMs: DISCOVERY_TIMEOUT_MS,
     signal
   })
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) throw discoveryError(res.status)
-    return []
-  }
+  // 失败一律抛出，不返回空列表：空列表会被调用方当成「发现成功但模型数为 0」，
+  // 而这是失败，应当降级并保留现有缓存（见 DiscoveryCache.get）。
+  if (!res.ok) throw httpFailure(res)
   const body = res.data
-  if (!body || body.code !== 0 || !body.data) return []
-  return selectCraftModels(body.data)
+  if (!body || body.code !== 0 || !body.data) throw payloadFailure(body ?? { code: 0 })
+  const models = selectCraftModels(body.data)
+  if (models.length === 0) {
+    // 拿不到任何模型：鉴权无效时上游仍回 200/code 0，但 agents 与 models 均为 null。
+    // 当作失败降级，避免把「只有 auto」当成发现结果写进缓存。
+    throw new DiscoveryError('model discovery 未返回任何模型（凭据可能已失效，请重新登录）')
+  }
+  return models
 }
 
 const DEFAULT_CONTEXT = 131_072
@@ -270,6 +310,8 @@ function isAuthError(e: unknown): boolean {
   return status === 401 || status === 403
 }
 
+export { isAuthError }
+
 export class DiscoveryCache {
   private data: RemoteModel[] | null = null
   private fetchedAt = 0
@@ -278,6 +320,8 @@ export class DiscoveryCache {
     private readonly opts: {
       ttlMs: number
       fetchFn: (token: string, signal?: AbortSignal) => Promise<RemoteModel[]>
+      /** 降级时回调失败原因（缓存本身只返回 null 信号，原因会在此透出给日志） */
+      onFailure?: (error: unknown) => void
     }
   ) {}
   /** 返回 null 表示本次为瞬时失败降级：调用方应保留现有模型列表/缓存，不要用 [auto] 兜底覆盖 */
@@ -294,8 +338,10 @@ export class DiscoveryCache {
       })
       .catch((e: unknown) => {
         if (isAuthError(e)) throw e
-        // 瞬时失败（网络/超时/5xx）：返回 null 信号降级，不把 [DEFAULT_MODEL] 当成功结果缓存
-        // —— 否则一次网络抖动会把磁盘上 15 个真实模型的缓存覆盖成只有 auto，且 5min TTL 内不再重试
+        // 瞬时失败（网络/超时/5xx/上游业务错误）：返回 null 信号降级，
+        // 不把 [DEFAULT_MODEL] 当成功结果缓存——否则一次网络抖动会把磁盘上
+        // 15 个真实模型的缓存覆盖成只有 auto，且 5min TTL 内不再重试
+        this.opts.onFailure?.(e)
         return null
       })
       .finally(() => {
