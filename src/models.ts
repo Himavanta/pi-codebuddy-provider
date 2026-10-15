@@ -312,10 +312,18 @@ function isAuthError(e: unknown): boolean {
 
 export { isAuthError }
 
+/**
+ * 失败冷却窗口：覆盖同一次启动中多个触发点先后调用的情况，
+ * 又短到用户重开一次 pi（或 /reload）就会重新尝试。
+ */
+export const FAILURE_COOLDOWN_MS = 60_000
+
 export class DiscoveryCache {
   private data: RemoteModel[] | null = null
   private fetchedAt = 0
   private inflight: Promise<RemoteModel[] | null> | null = null
+  /** 上次失败的时间；用于失败冷却（见 get） */
+  private failedAt = 0
   constructor(
     private readonly opts: {
       ttlMs: number
@@ -324,33 +332,62 @@ export class DiscoveryCache {
       onFailure?: (error: unknown) => void
     }
   ) {}
+  /**
+   * 是否处于失败冷却期。
+   *
+   * 失败不能像成功那样用 ttlMs 兜住（那会把一次网络抖动固化 5min），但完全不记
+   * 也不行：交互式启动会有**两个**触发点先后调到这里（本扩展的 session_start 后台
+   * 发现，以及 pi 自己在 interactive-mode.js 里的 refreshModelCatalogs），离线时
+   * 两次都会真发请求、各报一条相同的警告。
+   * 用较短的冷却窗口让第二个调用点静默复用失败结论，既不重复请求也不重复提示，
+   * 且冷却过后仍会重试（不会像成功缓存那样卡住）。
+   */
+  private inFailureCooldown(now: number): boolean {
+    return this.failedAt > 0 && now - this.failedAt < FAILURE_COOLDOWN_MS
+  }
   /** 返回 null 表示本次为瞬时失败降级：调用方应保留现有模型列表/缓存，不要用 [auto] 兜底覆盖 */
   async get(token: string, { signal }: { signal?: AbortSignal }): Promise<RemoteModel[] | null> {
     const now = Date.now()
     if (this.data && now - this.fetchedAt < this.opts.ttlMs) return this.data
-    if (this.inflight) return this.inflight
+    if (this.inflight) return this.awaitInflight(this.inflight)
+    // 冷却期内：有旧数据就用旧数据，没有则返回 null（降级但不再请求、不再提示）
+    if (this.inFailureCooldown(now)) return this.data
     this.inflight = this.opts
       .fetchFn(token, signal)
       .then((d) => {
         this.data = d
         this.fetchedAt = Date.now()
+        this.failedAt = 0
         return d
       })
       .catch((e: unknown) => {
+        // 先记失败时间：认证失败也要进冷却，否则两个触发点会各提示一次
+        // 「登录已失效」。冷却期内的后续调用返回旧数据（降级），不再上报。
+        this.failedAt = Date.now()
+        // 认证失败仍上抛：调用方据此提示重新登录，且不做成功降级
         if (isAuthError(e)) throw e
         // 瞬时失败（网络/超时/5xx/上游业务错误）：返回 null 信号降级，
         // 不把 [DEFAULT_MODEL] 当成功结果缓存——否则一次网络抖动会把磁盘上
-        // 15 个真实模型的缓存覆盖成只有 auto，且 5min TTL 内不再重试
+        // 15 个真实模型的缓存覆盖成只有 auto。
         this.opts.onFailure?.(e)
         return null
       })
       .finally(() => {
         this.inflight = null
       })
-    if (this.data) {
-      this.inflight.catch(() => {})
-      return this.data
-    }
-    return this.inflight
+    return this.awaitInflight(this.inflight)
+  }
+  /**
+   * 等待在途请求，失败时兑回旧数据。
+   *
+   * 直接 return inflight 会让失败期间仍在途的并发调用拿到 null，即使手上有旧数据
+   * （stale-while-revalidate 的意图就落空了）。
+   * 不吞异常：401/403 由 inflight 上抛，必须继续传给调用方（见 isAuthError）。
+   * 不引 onFailure：它已在请求自己的 catch 里报过一次，此处只是另一个等待者。
+   */
+  private async awaitInflight(
+    inflight: Promise<RemoteModel[] | null>
+  ): Promise<RemoteModel[] | null> {
+    return (await inflight) ?? this.data
   }
 }

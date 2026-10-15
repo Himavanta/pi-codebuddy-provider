@@ -303,7 +303,9 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   // 工厂阶段拿不到 ctx（ExtensionAPI 上没有 ui），只有事件 handler 才有，故在此绑定。
   // 绑定后日志走 ctx.ui.notify，不再写 stderr —— 交互模式（fullscreen）下 stderr 无人
   // 接管，直写会把 TUI 画花（见 log.ts）。
-  // 后台发现：不阻塞启动；失败只提示一次，不重试（DiscoveryCache 的 5min TTL 亦限制频率）。
+  // 后台发现：不阻塞启动；失败不重试。同一启动内的重复提示由 DiscoveryCache
+  // 的失败冷却窗口挡掉（见 models.ts 的 FAILURE_COOLDOWN_MS），因为交互式模式下
+  // pi 自己还会再刷一次模型目录，两个触发点会先后调到这里。
   pi.on('session_start', (_event, ctx) => {
     logger.bindUI(ctx.hasUI ? ctx.ui : undefined)
     const token = syncSnapshot.value?.access

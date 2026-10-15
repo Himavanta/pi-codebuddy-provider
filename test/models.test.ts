@@ -8,7 +8,8 @@ import {
   buildThinkingLevelMap,
   fetchRemoteModels,
   DEFAULT_MODEL,
-  DiscoveryCache
+  DiscoveryCache,
+  FAILURE_COOLDOWN_MS
 } from '../src/models.ts'
 import type { RemoteModel } from '../src/models.ts'
 
@@ -487,13 +488,84 @@ describe('buildThinkingLevelMap（pi 档位 → 上游取值）', () => {
 })
 
 describe('DiscoveryCache 瞬时失败降级保护', () => {
-  it('失败且无旧数据 → 返回 null，不缓存 [auto] 兜底', async () => {
+  it('失败不缓存为成功：返回 null 而非 [auto] 兜底', async () => {
     const fetchFn = vi.fn().mockRejectedValue(new Error('network down'))
     const c = new DiscoveryCache({ ttlMs: 60_000, fetchFn })
+    // 原实现会把 [DEFAULT_MODEL] 当成功结果缓存 5min TTL；修复后失败返回 null
     await expect(c.get('t', {})).resolves.toBeNull()
-    // 原实现会把 [DEFAULT_MODEL] 当成功结果缓存 5min TTL；修复后失败不缓存，下次仍会重试
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('失败冷却：同一启动内第二个触发点不再请求、不再提示', async () => {
+    // 交互式启动有两个触发点先后调到这里（本扩展的 session_start 后台发现，
+    // 以及 pi 自己的 refreshModelCatalogs）；离线时曾经两次都发请求、各报一条相同警告。
+    const e = new Error('model discovery: fetch failed')
+    const fetchFn = vi.fn().mockRejectedValue(e)
+    const onFailure = vi.fn()
+    const c = new DiscoveryCache({ ttlMs: 60_000, fetchFn, onFailure })
     await expect(c.get('t', {})).resolves.toBeNull()
+    await expect(c.get('t', {})).resolves.toBeNull()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    expect(onFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('冷却期内有旧数据时返回旧数据（且不再请求）', async () => {
+    const good = [{ id: 'm1', name: 'M1' }]
+    let fail = false
+    const fetchFn = vi
+      .fn()
+      .mockImplementation(() => (fail ? Promise.reject(new Error('boom')) : Promise.resolve(good)))
+    const c = new DiscoveryCache({ ttlMs: 10, fetchFn })
+    await c.get('t', {})
+    await new Promise((r) => setTimeout(r, 20)) // TTL 过期
+    fail = true
+    expect(await c.get('t', {})).toEqual(good) // 发请求并失败，但有旧数据兑住（stale-while-revalidate）
     expect(fetchFn).toHaveBeenCalledTimes(2)
+    // 冷却期内：既不重新请求，也不返回 null
+    expect(await c.get('t', {})).toEqual(good)
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('在途失败时并发等待者也拿到旧数据（而非 null）', async () => {
+    // 回归测试：原实现直接 return inflight，失败时并发调用会拿到 null，
+    // 即使手上有旧数据（stale-while-revalidate 失效）
+    const good = [{ id: 'm1', name: 'M1' }]
+    let fail = false
+    const fetchFn = vi
+      .fn()
+      .mockImplementation(() => (fail ? Promise.reject(new Error('boom')) : Promise.resolve(good)))
+    const c = new DiscoveryCache({ ttlMs: 10, fetchFn })
+    await c.get('t', {})
+    await new Promise((r) => setTimeout(r, 20))
+    fail = true
+    const [a, b] = await Promise.all([c.get('t', {}), c.get('t', {})])
+    expect(a).toEqual(good)
+    expect(b).toEqual(good)
+    expect(fetchFn).toHaveBeenCalledTimes(2) // 只发了一次新请求
+  })
+
+  it('冷却期过后会重试（不会像成功缓存那样卡住）', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchFn = vi.fn().mockRejectedValue(new Error('down'))
+      const c = new DiscoveryCache({ ttlMs: 60_000, fetchFn })
+      await c.get('t', {})
+      vi.advanceTimersByTime(FAILURE_COOLDOWN_MS + 1)
+      await c.get('t', {})
+      expect(fetchFn).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('成功后立即恢复：冷却不影响正常命中', async () => {
+    const good = [{ id: 'm1', name: 'M1' }]
+    const fetchFn = vi.fn().mockRejectedValueOnce(new Error('down')).mockResolvedValue(good)
+    const c = new DiscoveryCache({ ttlMs: 60_000, fetchFn })
+    await c.get('t', {})
+    // 冷却期内成功路径仍能跑（cooldown 只拦「没有新结论」的重复请求）
+    await c.get('t', {})
+    expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
   it('有旧数据时瞬时失败 → 返回旧数据（不降级）', async () => {
@@ -515,6 +587,29 @@ describe('DiscoveryCache 瞬时失败降级保护', () => {
     const e = Object.assign(new Error('discovery 401'), { status: 401 })
     const c = new DiscoveryCache({ ttlMs: 1000, fetchFn: vi.fn().mockRejectedValue(e) })
     await expect(c.get('t', {})).rejects.toMatchObject({ status: 401 })
+  })
+
+  it('认证失败也进冷却：第二个触发点不再重复提示「登录已失效」', async () => {
+    // 交互式启动两个触发点；token 过期时曾经两次都抛、各提示一次
+    const e = Object.assign(new Error('401'), { status: 401 })
+    const fetchFn = vi.fn().mockRejectedValue(e)
+    const c = new DiscoveryCache({ ttlMs: 60_000, fetchFn })
+    await expect(c.get('t', {})).rejects.toMatchObject({ status: 401 })
+    // 冷却期内不上抛也不请求；模型列表与凭据无关，有缓存则照常返回
+    await expect(c.get('t', {})).resolves.toBeNull()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('认证失败冷却期内仍返回旧模型列表（token 过期不影响列表有效性）', async () => {
+    const good = [{ id: 'm1', name: 'M1' }]
+    const fetchFn = vi.fn().mockResolvedValue(good)
+    const c = new DiscoveryCache({ ttlMs: 10, fetchFn })
+    await c.get('t', {})
+    await new Promise((r) => setTimeout(r, 20))
+    fetchFn.mockRejectedValue(Object.assign(new Error('401'), { status: 401 }))
+    await expect(c.get('t', {})).rejects.toMatchObject({ status: 401 })
+    await expect(c.get('t', {})).resolves.toEqual(good)
+    expect(fetchFn).toHaveBeenCalledTimes(2)
   })
 })
 
