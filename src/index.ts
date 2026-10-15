@@ -189,30 +189,34 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
     return models.length ? models : null
   }
 
-  /** 发现失败的统一日志：认证类提示重新登录，其余把原因写清楚（含上游错误码与文案） */
+  /** 发现失败的提示：认证类让用户重新登录，其余说明列表未更新并带上原因 */
   function logDiscoveryFailure(e: unknown): void {
     const message = e instanceof Error ? e.message : String(e)
     if (isAuthError(e)) {
-      logger.warn(
-        `model discovery 认证失败 — token 可能已过期，请重新 /login codebuddy（${message}）`
-      )
+      logger.warn('CodeBuddy 登录已失效，模型列表未更新 — 请重新 /login codebuddy')
     } else {
-      logger.warn(`model discovery 失败，沿用现有模型列表：${message}`)
+      logger.warn(`CodeBuddy 模型列表未更新，沿用本地缓存：${message}`)
     }
   }
 
+  // 会话代次：session_shutdown 时 +1，用于丢弃上一个会话遗留的后台发现回调。
+  // 不这么做的话，reload 前发起的发现会在新会话里重新注册模型（旧列表覆盖新会话），
+  // 且在 ctx 失效后输出提示。
+  let sessionGen = 0
+
   // 主动发现 + 重注册（registerProvider 可随时调用并立即生效）
   // 返回 false 表示发现降级：保留现有 registeredModels 与磁盘缓存
-  async function discoverAndReregister(token: string): Promise<boolean> {
+  async function discoverAndReregister(token: string, gen = sessionGen): Promise<boolean> {
     try {
       const models = await discoverModels(token)
-      if (!models) return false
+      if (!models || gen !== sessionGen) return false
       registeredModels = models
       register(models)
       await writeCachedModels(models)
       return true
     } catch (e) {
-      logDiscoveryFailure(e)
+      // 会话已切换时它的失败提示已无意义，且 ctx 已失效（见 session_shutdown）
+      if (gen === sessionGen) logDiscoveryFailure(e)
       return false
     }
   }
@@ -282,16 +286,35 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
 
   register(registeredModels)
 
-  // 启动时已有快照 token → 发现真实模型列表
-  // 注意：必须 await。原先的 void（fire-and-forget）会让发现与进程退出赛跑，
-  // --list-models 这类短命进程会在 /v3/config 返回前退出，缓存永远写不进。
-  // 扩展 factory 阶段 pi 会等待，且 discoveryCache 有 5s 超时与 try/catch 兜底，不会卡住启动。
   const mode = pickAuthMode(cfg, credToAuthState(syncSnapshot.value))
-  if (mode === 'oauth' && syncSnapshot.value?.access) {
-    await discoverAndReregister(syncSnapshot.value.access)
-  } else if (mode === 'api' && !cfg.apiKey) {
+  const startupToken = mode === 'oauth' ? syncSnapshot.value?.access : undefined
+
+  // 首次启动（无落盘缓存）才等待发现：否则 --list-models 这类短命进程会在 /v3/config
+  // 返回前退出，缓存永远写不进（pi 会等待异步 factory，见 extensions.md）。
+  // 有缓存则立即返回、不阻塞启动，交给下面的 session_start 后台刷新。
+  if (startupToken && cachedModels.length === 0) {
+    await discoverAndReregister(startupToken)
+  }
+  if (mode === 'api' && !cfg.apiKey) {
     logger.warn('api key mode requested but no key found — set CODEBUDDY_API_KEY')
   }
+
+  // --- 会话生命周期：绑定 pi 的 UI 通道 + 后台发现模型 ---
+  // 工厂阶段拿不到 ctx（ExtensionAPI 上没有 ui），只有事件 handler 才有，故在此绑定。
+  // 绑定后日志走 ctx.ui.notify，不再写 stderr —— 交互模式（fullscreen）下 stderr 无人
+  // 接管，直写会把 TUI 画花（见 log.ts）。
+  // 后台发现：不阻塞启动；失败只提示一次，不重试（DiscoveryCache 的 5min TTL 亦限制频率）。
+  pi.on('session_start', (_event, ctx) => {
+    logger.bindUI(ctx.hasUI ? ctx.ui : undefined)
+    const token = syncSnapshot.value?.access
+    if (token) void discoverAndReregister(token)
+  })
+  // 会话结束：ctx 在 reload/会话替换后失效，不能继续持有。
+  // 加代次是为了让此前发起的后台发现作废（否则它的结果会落到新会话里）。
+  pi.on('session_shutdown', () => {
+    sessionGen++
+    logger.silence()
+  })
 
   // --- compaction 后淘汰 conversation-id（对应 opencode session.compacted）---
   pi.on('session_before_compact', (_event, ctx) => {

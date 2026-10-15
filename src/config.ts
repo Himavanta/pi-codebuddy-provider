@@ -10,7 +10,10 @@ export const DOMAIN_DEFAULT = 'www.codebuddy.cn'
 export const PRODUCT = 'SaaS'
 export const AGENT_INTENT = 'craft'
 export const ENV_ID = 'production'
-export const DISCOVERY_TIMEOUT_MS = 5000
+// 发现请求超时。取 15s 与 pi 自身的模型目录刷新一致（interactive-mode.js 用 15_000）。
+// 实测 /v3/config 直连端到端 2.2~4.4s（TLS 握手即占 1~1.8s），原先的 5s 会随机超时。
+// 不重试：失败即沿用本地缓存，下一次启动或 /reload 会重来。
+export const DISCOVERY_TIMEOUT_MS = 15_000
 export const POLL_INTERVAL_MS = 3000
 export const POLL_TIMEOUT_MS = 8000
 export const POLL_TOTAL_TIMEOUT_MS = 10 * 60 * 1000
